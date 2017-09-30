@@ -1,0 +1,217 @@
+#!/usr/bin/python3
+
+## Copyright 2017 Skruppy <skruppy@onmars.eu>
+## 
+## Licensed under the Apache License, Version 2.0 (the "License");
+## you may not use this file except in compliance with the License.
+## You may obtain a copy of the License at
+## 
+##     http://www.apache.org/licenses/LICENSE-2.0
+## 
+## Unless required by applicable law or agreed to in writing, software
+## distributed under the License is distributed on an "AS IS" BASIS,
+## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+## See the License for the specific language governing permissions and
+## limitations under the License.
+
+import argparse
+import configparser
+import fcntl
+import os
+import os.path
+import shutil
+import subprocess
+import sys
+import tarfile
+import zipfile
+
+
+
+HOME = os.path.expanduser("~")
+XDG_DATA_HOME = os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share"))
+XDG_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config"))
+
+
+def exit(msg, error_code=1):
+	if msg:
+		print(msg)
+	sys.exit(error_code)
+
+
+def parseArgs():
+	parser = argparse.ArgumentParser(description='SSH Deployment helper for CI.')
+	parser.add_argument('--conf', '-c', metavar='FILE', action='append', help='Config file')
+	parser.add_argument('project', metavar='PROJECT', help='Project')
+	args = parser.parse_args()
+	return args
+
+
+def findConfigFile(args):
+	if args.conf is not None:
+		pathes = args.conf
+	elif 'DEPPY_CONFIG' in os.environ:
+		pathes = os.environ['DEPPY_CONFIG'].split(':')
+	else:
+		pathes = [
+			'~/deppy.ini',
+			os.path.join(XDG_CONFIG_HOME, 'deppy/config.ini'),
+			'/etc/deppy.ini',
+		]
+	
+	for path in map(lambda p: os.path.abspath(os.path.expanduser(p)), pathes):
+		if os.path.isfile(path):
+			return path
+	
+	exit('> No config found')
+
+
+def loadConfig(path):
+	defaults = {
+		'pre-commands': None,
+		'keep': 'no',
+		'destination': None,
+		'type': None,
+		'commands': None,
+	}
+	
+	config = configparser.ConfigParser(defaults = defaults)
+	config.read(path)
+	
+	## @todo some sanity checks
+	
+	return config
+
+
+def saveStdin(path):
+	with open(path, 'wb') as out:
+		shutil.copyfileobj(sys.stdin.buffer, out)
+
+
+def detectSdtin(path):
+	with open(path, 'rb') as out:
+		head = out.read(512)
+	
+	## See https://en.wikipedia.org/wiki/List_of_file_signatures
+	magics = [
+		{'offset': 0x101, 'magic': b'ustar\x0000', 'type': 'tar'},
+		{'offset': 0x101, 'magic': b'ustar  \x00', 'type': 'tar'},
+		{'offset': 0x0,   'magic': b'PK\x03\x04',  'type': 'zip'},
+		{'offset': 0x0,   'magic': b'PK\x05\x06',  'type': 'zip'},
+		{'offset': 0x0,   'magic': b'PK\x07\x08',  'type': 'zip'},
+	]
+	
+	for magic in magics:
+		start = magic['offset']
+		end = start + len(magic['magic'])
+		if head[start:end] == magic['magic']:
+			return magic['type']
+	
+	exit('> Unknown file type')
+
+
+def accquireLock(path):
+	f = open(path, 'a+')
+	f.seek(0)
+	
+	try:
+		fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except BlockingIOError:
+		exit('> Already deploying (PID: %s)' % f.readline().strip())
+	
+	f.truncate()
+	f.write('%s\n' % os.getpid())
+	f.flush()
+	
+	return f
+
+
+def releaseLock(f):
+	f.close()
+	os.remove(f.name)
+
+
+def sh(commands, extraEnv = {}):
+	if commands is None:
+		return
+	
+	env = dict(os.environ)
+	env.update(extraEnv)
+	for line in map(lambda l: l.strip(), commands.split('\n')):
+		if line == '' or line.startswith('#'):
+			continue
+		elif line.startswith('@'):
+			line = line[1:]
+		else:
+			print('\033[1;32m$ %s\033[0m' % line)
+		
+		try:
+			subprocess.check_call(line, shell=True, env=env)
+		except subprocess.CalledProcessError:
+			exit('> FAILED')
+
+
+def main():
+	args = parseArgs()
+	configFile = findConfigFile(args)
+	config = loadConfig(configFile)
+	
+	projectName = args.project
+	if projectName not in config:
+		exit('> Project "%s" does not exist' % projectName)
+	
+	dataDir = os.path.join(XDG_DATA_HOME, 'deppy')
+	
+	project = config[projectName]
+	
+	projectCacheDir = os.path.join(dataDir, projectName)
+	lockFile = os.path.join(projectCacheDir, 'lock')
+	inputFile = os.path.join(projectCacheDir, 'input')
+	dstDir = project['destination']
+	if dstDir is None:
+		dstDir = os.path.join(projectCacheDir, 'data')
+	
+	os.makedirs(projectCacheDir, exist_ok=True)
+	lock = accquireLock(lockFile)
+	saveStdin(inputFile)
+	
+	## Exec pre-commands
+	env = {
+		'DEPPY_DESTINATION': dstDir,
+		'DEPPY_PROJECT': projectName,
+	}
+	
+	sh(project['pre-commands'], env)
+	
+	## Prepare dst
+	if not project.getboolean('keep'):
+		print('> Cleaning destination directory')
+		if os.path.exists(dstDir):
+			shutil.rmtree(dstDir)
+	
+	## Extract into dst
+	type = project['type']
+	if type is None:
+		type = detectSdtin(inputFile)
+	
+	if type == 'zip':
+		with zipfile.ZipFile(inputFile) as zip:
+			zip.extractall(dstDir)
+	elif type == 'tar':
+		os.mkdir(dstDir)
+		with tarfile.open(inputFile) as tar:
+			tar.extractall(dstDir)
+	else:
+		exit('> Unknown input type %s' % type)
+	
+	## Exec commands
+	sh(project['commands'], env)
+	
+	## Cleanup
+	os.remove(inputFile)
+	releaseLock(lock)
+	
+	exit('> DONE', 0)
+
+
+if __name__ == '__main__':
+	main()
